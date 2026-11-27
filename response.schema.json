@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "text": {"type": "string", "maxLength": 12000},
+    "meme_id": {"type": ["integer", "null"]},
+    "memory": {"type": "string", "maxLength": 5000},
+    "document": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "object", "additionalProperties": false,
+         "properties": {"filename": {"type": "string"}, "content": {"type": "string", "maxLength": 20000}},
+         "required": ["filename", "content"]}
+      ]
+    }
+  },
+  "required": ["text", "meme_id", "memory", "document"]
+}
