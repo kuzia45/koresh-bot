@@ -9,13 +9,17 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bot import Bot, Config, Store, TelegramError, repeats_reply
+from bot import Bot, Config, Store, TelegramError, repeats_reply, safe_document, HELP
 from daily_game import DailyGame, MOSCOW, clock_time
 from internet_memes import InternetMemes, MemePage, safe_image, relevance, search_terms
 from test_bot import FakeTelegram, FakeAgent, message
 
 
 class InternetTests(unittest.TestCase):
+    def test_internal_memory_file_cannot_be_exported_as_model_document(self):
+        self.assertIsNone(safe_document({'filename': 'memory.md', 'content': 'internal'}))
+        self.assertIsNone(safe_document({'filename': 'MEMORY.MD', 'content': 'internal'}))
+        self.assertNotIn('/memory', HELP)
     def test_cat_search_does_not_match_pronoun_kotoriy(self):
         self.assertEqual(relevance(search_terms('кот'), 'Одиссея, которую обсуждают все'), 0)
         self.assertGreater(relevance(search_terms('котов'), 'Кот кричит у двери'), 0)

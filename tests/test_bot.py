@@ -274,15 +274,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         reply = [p for method, p in self.tg.sent if method == 'sendMessage'][-1]
         self.assertEqual(reply['message_thread_id'], 11)
 
-    async def test_automatic_memory_updates_and_memory_command_exports_it(self):
+    async def test_automatic_memory_updates_but_command_does_not_export_it(self):
         self.bot.store.allow(-100)
         self.agent.result = dict(self.agent.result, memory='- Друг любит настолки.')
         await self.bot.handle(message('Кореш, я люблю настолки'))
         await self.drain()
         self.assertIn('настолки', self.bot.store.memory(-100))
         await self.bot.handle(message('/memory', mid=2))
-        self.assertEqual(self.tg.sent[-1][0], 'sendDocument')
-        self.assertIn('настолки', self.tg.sent[-1][1]['content'].decode())
+        self.assertFalse(any(method == 'sendDocument' for method, _ in self.tg.sent))
+        self.assertIn('настолки', self.bot.store.memory(-100))
 
     async def test_foreign_bot_command_never_triggers_spontaneous(self):
         self.bot.cfg = dataclasses.replace(self.cfg, chance=0.25)

@@ -31,7 +31,7 @@ from daily_game import DailyGame, clock_time, local_now
 from internet_memes import InternetMemes
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 LOG = logging.getLogger("koresh")
 HELP = (
     "Я {name}, местный бот-кореш. Зови по имени, через @{username} или отвечай на мои сообщения.\n\n"
@@ -39,7 +39,7 @@ HELP = (
     "/pidor — пидор дня (один результат на день)\n/pidorstats — статистика\n"
     "/pidormembers — участники розыгрыша\n/pidorleave — не участвовать\n"
     "/noroast — не подкалывать меня\n/roast — снова можно\n"
-    "/memory — файл с памятью чата\n/privacy — что я запоминаю\n/settings — мои настройки\n\n"
+    "/privacy — что я запоминаю\n/settings — мои настройки\n\n"
     "Владелец: /allow, /quiet, /chatty, /remember текст, /forget.\n"
     "Розыгрыш: /pidortime ЧЧ:ММ, /pidoradd ответом на сообщение.\n"
     "В личке владельца: /login, /status, /cancel."
@@ -493,6 +493,8 @@ def safe_document(doc):
     if not isinstance(doc, dict) or not isinstance(doc.get("content"), str):
         return None
     filename = str(doc.get("filename", ""))
+    if filename.casefold() in ("memory.md", "agents.md", "persona.txt", "auth.json"):
+        return None
     if not re.fullmatch(r"[\w .-]{1,80}\.(?:txt|md|csv|json)", filename, re.I):
         return None
     if filename.startswith(".") or ".." in filename or len(doc["content"]) > 20000:
@@ -631,10 +633,7 @@ class Bot:
         elif cmd == "id":
             await self.say(m, f"Твой ID: {uid}; ID чата: {chat}.")
         elif cmd == "privacy":
-            await self.say(m, f"Я ИИ-бот. Для ответа передаю в OpenAI до {self.cfg.context} последних сообщений, выбранные файлы и память этого чата. История хранится до {self.cfg.history_days} дней, максимум 300 сообщений на чат; долгосрочная память — до /forget. Посмотреть её — /memory. При поиске мема на сайт отправляется только тема поиска. Для ежедневного розыгрыша сохраняются ID и имена участников и результаты. /noroast — без стёба над тобой и без участия в розыгрыше, /pidorleave — только выйти из розыгрыша.")
-        elif cmd == "memory":
-            text = self.store.export_memory(chat)
-            await self.tg.document(self.reply_payload(m), "memory.md", text.encode("utf-8"))
+            await self.say(m, f"Я ИИ-бот. Для ответа передаю в OpenAI до {self.cfg.context} последних сообщений, выбранные файлы и память этого чата. История хранится до {self.cfg.history_days} дней, максимум 300 сообщений на чат; долгосрочная память — до /forget. При поиске мема на сайт отправляется только тема поиска. Для ежедневного розыгрыша сохраняются ID и имена участников и результаты. /noroast — без стёба над тобой и без участия в розыгрыше, /pidorleave — только выйти из розыгрыша.")
         elif cmd == "settings":
             await self.say(m, f"Версия: {APP_VERSION}. Имя: {self.cfg.name}. Самостоятельные реплики: {'выключены' if self.store.quiet(chat) else f'до {self.cfg.chance:.0%} сообщений, пауза от {self.cfg.cooldown // 60} мин'}. Лимит Codex: {self.cfg.turns} запросов в час. Розыгрыш дня: {self.store.get(f'draw_time:{chat}', self.cfg.daily_time)} по Москве.", remember=False)
         elif cmd in ("noroast", "roast"):
@@ -1030,7 +1029,7 @@ class Bot:
             ("pidor", "Пидор дня"), ("pidorstats", "Статистика розыгрышей"),
             ("pidormembers", "Участники розыгрыша"), ("noroast", "Без стёба надо мной"),
             ("roast", "Вернуть дружеский стёб"), ("privacy", "Память и данные"),
-            ("memory", "Что я помню об этом чате"), ("settings", "Настройки бота"))])
+            ("settings", "Настройки бота"))])
         worker = asyncio.create_task(self.worker())
         daily = asyncio.create_task(self.daily_loop())
         offset = int(self.store.get("offset", "0"))
