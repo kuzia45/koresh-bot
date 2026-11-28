@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+from difflib import SequenceMatcher
 import io
 import json
 import logging
@@ -26,15 +27,21 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.etree import ElementTree
 
+from daily_game import DailyGame, clock_time, local_now
+from internet_memes import InternetMemes
+
 ROOT = Path(__file__).resolve().parent
+APP_VERSION = "2.0.0"
 LOG = logging.getLogger("koresh")
 HELP = (
     "Я {name}, местный бот-кореш. Зови по имени, через @{username} или отвечай на мои сообщения.\n\n"
-    "/meme [слово] — мем из копилки этой группы\n"
-    "/savememe подпись — ответь этой командой на фото, GIF, видео или стикер\n"
+    "/meme [тема] — готовый мем из интернета; можно просто попросить словами\n"
+    "/pidor — пидор дня (один результат на день)\n/pidorstats — статистика\n"
+    "/pidormembers — участники розыгрыша\n/pidorleave — не участвовать\n"
     "/noroast — не подкалывать меня\n/roast — снова можно\n"
     "/memory — файл с памятью чата\n/privacy — что я запоминаю\n/settings — мои настройки\n\n"
-    "Владелец: /allow, /quiet, /chatty, /remember текст, /forget, /delmeme номер.\n"
+    "Владелец: /allow, /quiet, /chatty, /remember текст, /forget.\n"
+    "Розыгрыш: /pidortime ЧЧ:ММ, /pidoradd ответом на сообщение.\n"
     "В личке владельца: /login, /status, /cancel."
 )
 
@@ -59,6 +66,7 @@ class Config:
     max_queue: int = 12
     port: int = 8080
     codex_bin: str = "codex"
+    daily_time: str = "12:00"
 
     @classmethod
     def load(cls):
@@ -86,6 +94,7 @@ class Config:
             max_queue=int(os.environ.get("MAX_QUEUE", "12")),
             port=int(os.environ.get("PORT", "8080")),
             codex_bin=os.environ.get("CODEX_BIN", "codex"),
+            daily_time=clock_time(os.environ.get("DAILY_DRAW_TIME", "12:00")),
         )
         if not (0 <= cfg.chance <= 0.25 and 60 <= cfg.cooldown <= 86400):
             raise ValueError("SPONTANEOUS_CHANCE: 0..0.25; SPONTANEOUS_COOLDOWN: 60..86400.")
@@ -172,6 +181,20 @@ class Store:
     def memory(self, chat):
         row = self.db.execute("SELECT text FROM memories WHERE chat=?", (chat,)).fetchone()
         return row[0] if row else ""
+
+    def migrate_behavior(self, bot_id):
+        """Один раз убираем старую петлю шуток; исходные заметки остаются в архиве БД."""
+        if self.get("behavior_v2"):
+            return
+        chats = [row[0] for row in self.db.execute("SELECT chat FROM memories")]
+        with self.db:
+            self.db.execute("CREATE TABLE IF NOT EXISTS memory_archive(chat INTEGER,text TEXT,ts REAL,reason TEXT)")
+            self.db.execute("INSERT INTO memory_archive SELECT chat,text,ts,'behavior_v2' FROM memories")
+            self.db.execute("DELETE FROM memories")
+            self.db.execute("DELETE FROM messages WHERE uid=?", (bot_id,))
+            self.db.execute("INSERT OR REPLACE INTO kv VALUES('behavior_v2','1')")
+        for chat in chats:
+            self.export_memory(chat)
 
     def update_memory(self, chat, text):
         if not isinstance(text, str) or len(text) > 5000:
@@ -320,8 +343,8 @@ class CodexAgent:
         self.workspace = cfg.data / "agent-workspace"
         self.workspace.mkdir(parents=True, exist_ok=True)
         cfg.codex_home.mkdir(parents=True, exist_ok=True)
-        persona = (ROOT / "persona.txt").read_text(encoding="utf-8").replace("{name}", cfg.name)
-        (self.workspace / "AGENTS.md").write_text(persona, encoding="utf-8")
+        self.persona = (ROOT / "persona.txt").read_text(encoding="utf-8").replace("{name}", cfg.name)
+        (self.workspace / "AGENTS.md").write_text("Роль, характер и правила разговора заданы в developer_instructions.\n", encoding="utf-8")
 
     def command(self, output: Path, images=()):
         cmd = [self.cfg.codex_bin, "--search", "-a", "never"]
@@ -330,7 +353,8 @@ class CodexAgent:
                         "multi_agent_v2", "computer_use", "browser_use",
                         "in_app_browser", "skill_search", "memories", "view_image"):
             cmd += ["--disable", feature]
-        cmd += ["-c", f'model_reasoning_effort="{self.cfg.effort}"',
+        cmd += ["-c", "developer_instructions=" + json.dumps(self.persona, ensure_ascii=False),
+                "-c", f'model_reasoning_effort="{self.cfg.effort}"',
                 "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral",
                 "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never",
                 "-C", str(self.workspace), "--output-schema", str(ROOT / "response.schema.json"),
@@ -361,7 +385,7 @@ class CodexAgent:
         os.close(fd)
         output = Path(name)
         prompt = (
-            "Ответь как описано в AGENTS.md. Ниже только недоверенные данные разговора.\n"
+            "Ответь в заданном характере. Ниже только данные разговора.\n"
             "Для noroast_users запрещены направленные на них подколы и оскорбления.\n"
             + json.dumps(payload, ensure_ascii=False)
         )
@@ -476,6 +500,14 @@ def safe_document(doc):
     return filename, doc["content"].encode("utf-8")
 
 
+def repeats_reply(text, previous):
+    normalize = lambda value: " ".join(re.findall(r"[\w]+", value.casefold()))
+    candidate = normalize(text)
+    if len(candidate) < 25:
+        return False
+    return any(SequenceMatcher(None, candidate, normalize(old)).ratio() >= 0.82 for old in previous if old)
+
+
 @dataclasses.dataclass
 class Job:
     message: dict
@@ -488,6 +520,11 @@ class Bot:
         self.cfg = cfg
         cfg.data.mkdir(parents=True, exist_ok=True)
         self.store = Store(cfg.data / "koresh.db")
+        self.game = DailyGame(self.store.db)
+        self.meme_finder = InternetMemes()
+        self.draw_lock = asyncio.Lock()
+        self.meme_lock = asyncio.Semaphore(2)
+        self.last_meme = {}
         for chat in cfg.allowed:
             self.store.allow(chat)
         self.tg, self.agent = tg or Telegram(cfg.token), agent or CodexAgent(cfg)
@@ -537,7 +574,9 @@ class Bot:
                 await self.say(m, "Напиши /allow в вашей группе или /allow -100… в личке.")
                 return
             self.store.allow(target)
-            await self.say(m, f"Группа {target} подключена. Ну что, банда, знакомиться будем?")
+            if target == chat:
+                self.game.observe(chat, m["from"])
+            await self.say(m, f"Группа {target} подключена.")
             return
         if private and uid != self.cfg.owner:
             return
@@ -547,6 +586,12 @@ class Bot:
             return
         if private:
             self.store.allow(chat)
+        else:
+            self.game.observe(chat, m["from"])
+            for user in m.get("new_chat_members", []):
+                self.game.observe(chat, user)
+            if m.get("left_chat_member"):
+                self.game.observe(chat, m["left_chat_member"], active=False)
         if cmd:
             await self.handle_command(m, cmd, arg)
             return
@@ -586,12 +631,12 @@ class Bot:
         elif cmd == "id":
             await self.say(m, f"Твой ID: {uid}; ID чата: {chat}.")
         elif cmd == "privacy":
-            await self.say(m, f"Я ИИ-бот. Для ответа отправляю в OpenAI до {self.cfg.context} последних сообщений этой ветки, текст выбранных файлов и память этого чата. История на хостинге хранится до {self.cfg.history_days} дней и максимум 300 сообщений на чат. Отдельно я обновляю долгосрочную память: имена, предпочтения, внутренние шутки и договорённости; она хранится до удаления. Посмотреть — /memory. Мемы сохраняются только по /savememe. /noroast отключает стёб над тобой; владелец может стереть контекст и память через /forget, мем — через /delmeme.")
+            await self.say(m, f"Я ИИ-бот. Для ответа передаю в OpenAI до {self.cfg.context} последних сообщений, выбранные файлы и память этого чата. История хранится до {self.cfg.history_days} дней, максимум 300 сообщений на чат; долгосрочная память — до /forget. Посмотреть её — /memory. При поиске мема на сайт отправляется только тема поиска. Для ежедневного розыгрыша сохраняются ID и имена участников и результаты. /noroast — без стёба над тобой и без участия в розыгрыше, /pidorleave — только выйти из розыгрыша.")
         elif cmd == "memory":
             text = self.store.export_memory(chat)
             await self.tg.document(self.reply_payload(m), "memory.md", text.encode("utf-8"))
         elif cmd == "settings":
-            await self.say(m, f"Имя: {self.cfg.name}. Стиль: жёсткий дружеский стёб. Самостоятельные реплики: {'выключены' if self.store.quiet(chat) else f'до {self.cfg.chance:.0%} сообщений, пауза от {self.cfg.cooldown // 60} мин'}. Общий лимит Codex: {self.cfg.turns} запросов в час.")
+            await self.say(m, f"Версия: {APP_VERSION}. Имя: {self.cfg.name}. Самостоятельные реплики: {'выключены' if self.store.quiet(chat) else f'до {self.cfg.chance:.0%} сообщений, пауза от {self.cfg.cooldown // 60} мин'}. Лимит Codex: {self.cfg.turns} запросов в час. Розыгрыш дня: {self.store.get(f'draw_time:{chat}', self.cfg.daily_time)} по Москве.", remember=False)
         elif cmd in ("noroast", "roast"):
             self.store.no_roast(chat, uid, sender(m), cmd == "noroast")
             await self.say(m, "Принято, над тобой не стебусь." if cmd == "noroast" else "Окей, возвращаем дружеский огонь.")
@@ -602,13 +647,25 @@ class Bot:
             else:
                 number = self.store.save_meme(chat, *found, arg)
                 await self.say(m, f"Мем №{number} в копилке. {arg[:160]}")
-        elif cmd == "meme":
+        elif cmd == "savedmeme":
             catalog = self.store.memes(chat)
             matches = [item for item in catalog if arg.casefold() in item["label"].casefold()] if arg else catalog
             if not matches:
                 await self.say(m, "В копилке такого нет. Ответь на мем командой /savememe и добавь подпись.")
             else:
                 await self.send_meme(m, random.choice(matches))
+        elif cmd == "meme":
+            if time.time() - self.last_meme.get(chat, 0) < 8:
+                return
+            if len(self.background) >= 3:
+                await self.say(m, "Секунду, ещё ищу предыдущий мем.")
+                return
+            self.last_meme[chat] = time.time()
+            task = asyncio.create_task(self.online_meme(m, arg[:100]))
+            self.background.add(task)
+            task.add_done_callback(self.background.discard)
+        elif cmd.startswith("pidor"):
+            await self.game_command(m, cmd, arg)
         elif cmd in ("quiet", "chatty", "remember", "forget", "delmeme", "deny"):
             if not owner:
                 await self.say(m, "Эту настройку меняет владелец бота.")
@@ -647,7 +704,7 @@ class Bot:
                 return
             if cmd == "status":
                 ok = await self.agent.auth_status()
-                await self.say(m, f"Codex по подписке: {'вход выполнен' if ok else 'нужен /login'}. В очереди: {self.queue.qsize()}. Активный запрос: {'да' if self.agent.active else 'нет'}. API-ключи бот не использует.", remember=False)
+                await self.say(m, f"Версия {APP_VERSION}. Codex по подписке: {'вход выполнен' if ok else 'нужен /login'}. В очереди: {self.queue.qsize()}. Активный запрос: {'да' if self.agent.active else 'нет'}. API-ключи бот не использует.", remember=False)
             elif cmd == "cancel":
                 if self.auth_task:
                     self.auth_task.cancel()
@@ -667,6 +724,153 @@ class Bot:
         payload[meme["kind"]] = meme["file_id"]
         result = await self.tg.call(methods[meme["kind"]], **payload)
         self.store.record(m["chat"]["id"], m.get("message_thread_id", 0), result["message_id"], self.me["id"], self.cfg.name, "[отправлен мем: " + meme["label"] + "]", self.cfg.history_days)
+
+    async def online_meme(self, m, query="", spontaneous=False):
+        chat = m["chat"]["id"]
+        epoch = self.epochs.get(chat, 0)
+        try:
+            async with self.meme_lock:
+                choices = await asyncio.wait_for(self.meme_finder.find(query, self.game.recent_memes(chat)), 35)
+                if epoch != self.epochs.get(chat, 0) or not self.store.allowed(chat):
+                    return False
+                if spontaneous and self.store.quiet(chat):
+                    return False
+                for item in choices:
+                    payload = self.reply_payload(m)
+                    payload.update(photo=item["url"], caption=("Источник: " + item["source"])[:1000])
+                    method = "sendPhoto"
+                    if urllib.parse.urlsplit(item["url"]).path.casefold().endswith(".gif"):
+                        method = "sendAnimation"
+                        payload["animation"] = payload.pop("photo")
+                    try:
+                        result = await self.tg.call(method, **payload)
+                    except TelegramError:
+                        continue
+                    self.game.record_meme(chat, item["url"])
+                    self.store.record(chat, m.get("message_thread_id", 0), result["message_id"], self.me["id"],
+                                      self.cfg.name, "[мем из интернета: " + item["title"][:200] + "]", self.cfg.history_days)
+                    return True
+                if not spontaneous:
+                    await self.say(m, "По этой теме не нашёл готовой картинки. Попробуй назвать тему короче." if query else "Сайты с мемами сейчас не ответили. Попробуй чуть позже.")
+        except (OSError, ValueError, TimeoutError, TelegramError):
+            if not spontaneous:
+                with contextlib.suppress(TelegramError):
+                    await self.say(m, "Мемы сейчас не загрузились. Попробуй ещё раз чуть позже.")
+        return False
+
+    async def membership(self, update):
+        chat = update.get("chat", {}).get("id", 0)
+        if chat >= 0 or not self.store.allowed(chat):
+            return
+        member = update.get("new_chat_member", {})
+        active = member.get("status") in ("member", "administrator", "creator") or (
+            member.get("status") == "restricted" and member.get("is_member"))
+        self.game.observe(chat, member.get("user", {}), active=active)
+
+    async def game_command(self, m, cmd, arg):
+        chat, uid = m["chat"]["id"], m["from"]["id"]
+        if chat >= 0:
+            await self.say(m, "Розыгрыш — в группе. Там /pidor, /pidorstats и /pidormembers.")
+            return
+        if cmd in ("pidor", "pidortoday"):
+            await self.draw(chat, message=m)
+        elif cmd == "pidorstats":
+            stats = self.game.stats(chat)
+            text = "Статистика пидора дня:\n" + "\n".join(f"{index}. {row['name']} — {row['wins']}" for index, row in enumerate(stats, 1)) if stats else "Пока никто не побеждал. /pidor — первый розыгрыш."
+            await self.say(m, text, remember=False)
+        elif cmd == "pidormembers":
+            members = self.game.candidates(chat)
+            await self.say(m, f"В розыгрыше: {len(members)}.\n" + "\n".join(x["name"] for x in members) + "\nУчитываю тех, кого видел в группе. Молчуна владелец может добавить: /pidoradd ответом на его сообщение.", remember=False)
+        elif cmd in ("pidorjoin", "pidorleave"):
+            self.game.opt_out(chat, uid, cmd == "pidorleave")
+            await self.say(m, "Ты вышел из розыгрыша." if cmd == "pidorleave" else "Ты участвуешь. Если раньше включал /noroast, сначала верни /roast.", remember=False)
+        elif cmd == "pidoradd":
+            if uid != self.cfg.owner:
+                await self.say(m, "Добавлять других участников может владелец.", remember=False)
+                return
+            user = m.get("reply_to_message", {}).get("from", {})
+            if not user or user.get("is_bot"):
+                await self.say(m, "Ответь /pidoradd на сообщение нужного человека.", remember=False)
+                return
+            status = await self.tg.call("getChatMember", chat_id=chat, user_id=user["id"])
+            if status.get("status") in ("left", "kicked"):
+                await self.say(m, "Этот человек уже вышел из группы.", remember=False)
+                return
+            self.game.observe(chat, user)
+            await self.say(m, "Участник добавлен. Посмотреть список: /pidormembers.", remember=False)
+        elif cmd in ("pidortime", "pidoron", "pidoroff"):
+            if uid != self.cfg.owner:
+                await self.say(m, "Расписание меняет владелец бота.", remember=False)
+                return
+            if cmd == "pidortime":
+                if not arg:
+                    await self.say(m, "Каждый день в " + self.store.get(f"draw_time:{chat}", self.cfg.daily_time) + " по Москве. Изменить: /pidortime 21:00", remember=False)
+                    return
+                try:
+                    self.store.set(f"draw_time:{chat}", clock_time(arg))
+                except ValueError as error:
+                    await self.say(m, str(error), remember=False)
+                    return
+                await self.say(m, f"Розыгрыш ежедневно в {arg} по Москве.", remember=False)
+            else:
+                self.store.set(f"draw_off:{chat}", "1" if cmd == "pidoroff" else "0")
+                await self.say(m, "Автоматический розыгрыш выключен." if cmd == "pidoroff" else "Автоматический розыгрыш включён.", remember=False)
+        else:
+            await self.say(m, "Команды: /pidor, /pidorstats, /pidormembers, /pidorjoin, /pidorleave.", remember=False)
+
+    async def draw(self, chat, message=None, now=None):
+        if not self.store.allowed(chat):
+            return
+        now = now or local_now()
+        day = now.date().isoformat()
+        async with self.draw_lock:
+            existing = self.game.result(chat, day)
+            if not existing:
+                # Не выбираем уже вышедшего человека. При сетевой ошибке отложим выбор.
+                for user in self.game.candidates(chat):
+                    status = await self.tg.call("getChatMember", chat_id=chat, user_id=user["uid"])
+                    if status.get("status") in ("left", "kicked"):
+                        with self.store.db:
+                            self.store.db.execute("UPDATE participants SET active=0 WHERE chat=? AND uid=?", (chat, user["uid"]))
+                if not self.store.allowed(chat):
+                    return
+                existing = self.game.choose(chat, day)
+            if not existing:
+                if message:
+                    await self.say(message, "Нужно хотя бы два участника. Напишите что-нибудь в группе или /pidorjoin.", remember=False)
+                return
+            if existing["announced"] and message is None:
+                return
+            name = existing["name"]
+            prefix = "🏆 Пидор дня — "
+            text = prefix + name + f".\n{day}. Побед за всё время: {self.game.wins(chat, existing['uid'])}.\nВыбран случайно из {existing['participants']} участников."
+            payload = self.reply_payload(message) if message else {"chat_id": chat}
+            payload.update(text=text, entities=[{"type": "text_mention", "offset": len(prefix.encode('utf-16-le')) // 2,
+                "length": len(name.encode('utf-16-le')) // 2,
+                "user": {"id": existing["uid"], "is_bot": False, "first_name": name}}])
+            await self.tg.call("sendMessage", **payload)
+            self.game.mark_announced(chat, day)
+
+    async def daily_tick(self, now=None):
+        now = now or local_now()
+        for row in list(self.store.db.execute("SELECT id FROM chats WHERE id<0")):
+            chat = row[0]
+            if self.store.get(f"draw_off:{chat}", "0") == "1":
+                continue
+            due = self.store.get(f"draw_time:{chat}", self.cfg.daily_time)
+            if now.strftime("%H:%M") >= due:
+                try:
+                    await self.draw(chat, now=now)
+                except TelegramError as error:
+                    if error.code in (400, 403):
+                        LOG.warning("Daily draw unavailable for chat; check group permissions")
+                    else:
+                        LOG.warning("Daily draw delivery failed; will retry without reroll")
+
+    async def daily_loop(self):
+        while True:
+            await self.daily_tick()
+            await asyncio.sleep(30)
 
     async def login(self, m):
         try:
@@ -748,16 +952,21 @@ class Bot:
                     if job.direct:
                         await self.say(m, "На этот час лимит разговоров исчерпан. Немного выдохну — и вернусь.")
                     continue
-                catalog = self.store.memes(chat)
+                recent = self.store.context(chat, m.get("message_thread_id", 0), self.cfg.context)
+                bot_replies = [item["text"] for item in recent if item["user_id"] == self.me["id"]][-8:]
+                bot_ids = {item["message_id"] for item in recent if item["user_id"] == self.me["id"]}
+                last_bot_ids = set(list(item["message_id"] for item in recent if item["user_id"] == self.me["id"])[-3:])
+                recent = [dict(item, role="bot" if item["user_id"] == self.me["id"] else "human")
+                          for item in recent if item["message_id"] not in bot_ids or item["message_id"] in last_bot_ids]
                 payload = {
                     "mode": "direct" if job.direct else "spontaneous",
                     "chat_title": m["chat"].get("title", "Личный чат владельца"),
                     "current_message": {"message_id": m["message_id"], "user_id": m["from"]["id"], "name": sender(m), "text": describe(m)},
                     "reply_to": {"name": sender(m["reply_to_message"]), "text": describe(m["reply_to_message"])} if m.get("reply_to_message") else None,
-                    "recent_messages": self.store.context(chat, m.get("message_thread_id", 0), self.cfg.context),
+                    "recent_messages": recent,
+                    "recent_bot_replies_to_avoid_repeating": bot_replies,
                     "group_notes": self.store.facts(chat), "noroast_users": self.store.protected(chat),
                     "long_term_memory": self.store.memory(chat),
-                    "memes": [{"id": x["id"], "label": x["label"]} for x in catalog],
                     "utc_time": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
                 }
                 with tempfile.TemporaryDirectory(prefix="files-", dir=self.cfg.data) as directory:
@@ -766,6 +975,11 @@ class Bot:
                     typing = asyncio.create_task(self.typing(m))
                     try:
                         result = await self.agent.run(payload, images)
+                        if repeats_reply(result.get("text", ""), bot_replies):
+                            payload["rewrite_instruction"] = "Предыдущая попытка повторяла старый ответ. Ответь заново на текущую реплику прямо и коротко, без старых шуток и тем."
+                            result = await self.agent.run(payload, images) if self.store.reserve_turn(self.cfg.turns) else dict(result, text="")
+                            if repeats_reply(result.get("text", ""), bot_replies):
+                                result["text"] = ""
                     finally:
                         typing.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
@@ -778,9 +992,8 @@ class Bot:
                     self.store.update_memory(chat, result["memory"])
                 if result.get("text", "").strip():
                     await self.say(m, result["text"].strip()[:12000])
-                selected = next((x for x in catalog if type(result.get("meme_id")) is int and x["id"] == result["meme_id"]), None)
-                if selected:
-                    await self.send_meme(m, selected)
+                if isinstance(result.get("meme_query"), str):
+                    await self.online_meme(m, result["meme_query"][:100], spontaneous=not job.direct)
                 document = safe_document(result.get("document"))
                 if document and job.direct:
                     await self.tg.document(self.reply_payload(m), *document)
@@ -808,29 +1021,34 @@ class Bot:
 
     async def run(self):
         self.me = await self.tg.call("getMe")
-        LOG.info("Bot connected; Codex %s", "subscription login ready" if await self.agent.auth_status() else "awaiting owner /login")
+        self.store.migrate_behavior(self.me["id"])
+        LOG.info("Bot connected; version %s; Codex %s", APP_VERSION, "subscription login ready" if await self.agent.auth_status() else "awaiting owner /login")
         # Это polling-бот: существующий webhook намеренно отключается, очередь сохраняется.
         await self.tg.call("deleteWebhook", drop_pending_updates=False)
         await self.tg.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in (
-            ("help", "Как со мной общаться"), ("meme", "Мем из копилки"),
-            ("savememe", "Сохранить мем из реплая"), ("noroast", "Без стёба надо мной"),
+            ("help", "Как со мной общаться"), ("meme", "Готовый мем из интернета"),
+            ("pidor", "Пидор дня"), ("pidorstats", "Статистика розыгрышей"),
+            ("pidormembers", "Участники розыгрыша"), ("noroast", "Без стёба надо мной"),
             ("roast", "Вернуть дружеский стёб"), ("privacy", "Память и данные"),
             ("memory", "Что я помню об этом чате"), ("settings", "Настройки бота"))])
         worker = asyncio.create_task(self.worker())
+        daily = asyncio.create_task(self.daily_loop())
         offset = int(self.store.get("offset", "0"))
         try:
             while self.running:
                 try:
                     self.store.prune(self.cfg.history_days)
-                    updates = await self.tg.call("getUpdates", offset=offset, timeout=30, allowed_updates=["message"])
+                    updates = await self.tg.call("getUpdates", offset=offset, timeout=30, allowed_updates=["message", "chat_member"])
                     for update in updates:
                         offset = update["update_id"] + 1
                         self.store.set("offset", offset)
-                        if update.get("message"):
-                            try:
+                        try:
+                            if update.get("message"):
                                 await self.handle(update["message"])
-                            except TelegramError as exc:
-                                LOG.warning("Message handling failed (Telegram %s)", exc.code)
+                            elif update.get("chat_member"):
+                                await self.membership(update["chat_member"])
+                        except TelegramError as exc:
+                            LOG.warning("Message handling failed (Telegram %s)", exc.code)
                 except TelegramError as exc:
                     if exc.code in (401, 409):
                         LOG.error("Telegram %s: check token or stop second bot instance", exc.code)
@@ -839,10 +1057,18 @@ class Bot:
                     await asyncio.sleep(5)
         finally:
             worker.cancel()
+            daily.cancel()
+            background = list(self.background)
+            for task in background:
+                task.cancel()
             if self.auth_task:
                 self.auth_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
+            with contextlib.suppress(asyncio.CancelledError):
+                await daily
+            if background:
+                await asyncio.gather(*background, return_exceptions=True)
             if self.auth_task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.auth_task

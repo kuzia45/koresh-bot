@@ -9,7 +9,7 @@ RUN apt-get update \
 
 # Bothost монтирует исходники поверх /app. Программа живёт отдельно.
 WORKDIR /opt/koresh
-COPY bot.py persona.txt response.schema.json ./
+COPY bot.py daily_game.py internet_memes.py persona.txt response.schema.json ./
 ENV PYTHONUNBUFFERED=1 \
     OWNER_ID=379721932 \
     DATA_DIR=/app/data \

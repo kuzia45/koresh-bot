@@ -3,7 +3,7 @@
   "additionalProperties": false,
   "properties": {
     "text": {"type": "string", "maxLength": 12000},
-    "meme_id": {"type": ["integer", "null"]},
+    "meme_query": {"type": ["string", "null"]},
     "memory": {"type": "string", "maxLength": 5000},
     "document": {
       "anyOf": [
@@ -14,5 +14,5 @@
       ]
     }
   },
-  "required": ["text", "meme_id", "memory", "document"]
+  "required": ["text", "meme_query", "memory", "document"]
 }

@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -32,6 +32,8 @@ class FakeTelegram:
     async def call(self, method, **payload):
         self.sent.append((method, payload))
         self.counter += 1
+        if method == 'getChatMember':
+            return {'status': 'member'}
         return {'message_id': self.counter}
 
     async def document(self, payload, filename, content):
@@ -43,7 +45,7 @@ class FakeAgent:
 
     def __init__(self):
         self.payloads = []
-        self.result = {'text': 'Ну ты дал.', 'meme_id': None, 'document': None}
+        self.result = {'text': 'Ну ты дал.', 'meme_query': None, 'document': None}
 
     async def run(self, payload, images):
         self.payloads.append(payload)
@@ -157,9 +159,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.cfg = Config('test', 7, root, root / 'codex', chance=0)
         self.tg, self.agent = FakeTelegram(), FakeAgent()
         self.bot = Bot(self.cfg, self.tg, self.agent)
+        self.bot.meme_finder.find = AsyncMock(return_value=[])
         self.bot.me = {'id': 99, 'username': 'our_bot'}
 
     async def asyncTearDown(self):
+        tasks = list(self.bot.background)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self.bot.store.db.close()
         self.tmp.cleanup()
 
@@ -248,7 +256,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_save_and_send_group_meme(self):
         self.bot.store.allow(-100)
         await self.bot.handle(message('/savememe когда устал', reply_to_message={'photo': [{'file_id': 'PHOTO'}]}))
-        await self.bot.handle(message('/meme устал', mid=2))
+        await self.bot.handle(message('/savedmeme устал', mid=2))
         self.assertEqual(self.tg.sent[-1][0], 'sendPhoto')
         self.assertEqual(self.tg.sent[-1][1]['photo'], 'PHOTO')
 
